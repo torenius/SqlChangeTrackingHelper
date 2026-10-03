@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>SqlChangeTracking</RootNamespace>
+        <Nullable>enable</Nullable>
+        <LangVersion>default</LangVersion>
+
+        <PackageId>SqlChangeTrackingHelper</PackageId>
+        <Version>0.1</Version>
+        <Authors>Tommy Torenius</Authors>
+        <Description>
+            Makes it easier to read changes from SQL Server Change Tracking the right way:
+            in a snapshot, with checks for versions that are too old, and with an initial load that doesn't miss changes.
+        </Description>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <RepositoryUrl>https://github.com/torenius/SqlChangeTrackingHelper</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageTags>SqlServer;ChangeTracking;CDC;ETL</PackageTags>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+        <!-- Deterministic paths in the package when built in GitHub Actions, so it can be verified against the source -->
+        <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="..\README.md" Pack="true" PackagePath="\" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Microsoft.Data.SqlClient" Version="7.1.0" />
+    </ItemGroup>
+
+</Project>
