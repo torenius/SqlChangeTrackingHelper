@@ -104,7 +104,7 @@ public class SqlChangeTrackingHelper
             var table = await GetTableInfoAsync(connection, transaction, timeout, cancellationToken).ConfigureAwait(false);
 
             var isFullLoad = sinceVersion is null;
-            if (sinceVersion is not null && (sinceVersion < table.MinValidVersion || sinceVersion > table.CurrentVersion))
+            if (sinceVersion is not null && !IsValidSinceVersion(sinceVersion.Value, table.MinValidVersion, table.CurrentVersion))
             {
                 if (!_reinitializeWhenVersionTooOld)
                 {
@@ -132,6 +132,178 @@ public class SqlChangeTrackingHelper
             await SqlChangeTrackingChanges.CleanUpAsync(connection, transaction, command, reader, closeConnection).ConfigureAwait(false);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Changes can only be read since a version from CHANGE_TRACKING_MIN_VALID_VERSION up to the current version.
+    /// A newer version than the current one, for example after a database restore, can't be trusted either.
+    /// </summary>
+    internal static bool IsValidSinceVersion(long sinceVersion, long minValidVersion, long currentVersion) =>
+        sinceVersion >= minValidVersion && sinceVersion <= currentVersion;
+
+    /// <summary>
+    /// Gets the Change Tracking settings of the database and the tables that have Change Tracking enabled.
+    /// Requires VIEW CHANGE TRACKING on the tables to see them, and VIEW DATABASE STATE for includeSizes.
+    /// </summary>
+    /// <param name="connection">SqlConnection to the database. If it's closed, it's opened and closed again.</param>
+    /// <param name="includeSizes">Also gets the number of rows and the size of each table and its internal Change Tracking table. Requires VIEW DATABASE STATE.</param>
+    /// <param name="timeout">Number of seconds for the command to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
+    /// <param name="cancellationToken">Cancels the operation</param>
+    /// <returns>The settings and the tables</returns>
+    /// <exception cref="InvalidOperationException">If Change Tracking is not enabled for the database</exception>
+    public static async Task<SqlChangeTrackingInfo> GetChangeTrackingInfoAsync(SqlConnection connection, bool includeSizes = false, int timeout = 30,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var closeConnection = false;
+        if (connection.State != ConnectionState.Open)
+        {
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            closeConnection = true;
+        }
+
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandTimeout = timeout;
+            command.CommandText = CreateChangeTrackingInfoSql(includeSizes);
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw new InvalidOperationException($"Change Tracking is not enabled for the database '{connection.Database}'. " +
+                                                    $"Enable it with: ALTER DATABASE {Quote(connection.Database)} SET CHANGE_TRACKING = ON (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);");
+            }
+
+            var currentVersion = reader.GetInt64(0);
+            var retention = reader.GetString(2) switch
+            {
+                "MINUTES" => TimeSpan.FromMinutes(reader.GetInt32(1)),
+                "HOURS" => TimeSpan.FromHours(reader.GetInt32(1)),
+                _ => TimeSpan.FromDays(reader.GetInt32(1))
+            };
+            var autoCleanup = reader.GetBoolean(3);
+            var snapshotIsolationAllowed = reader.GetBoolean(4);
+
+            // The primary key columns of all tracked tables, in key order
+            await reader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+            var primaryKeys = new Dictionary<int, List<string>>();
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var objectId = reader.GetInt32(0);
+                if (!primaryKeys.TryGetValue(objectId, out var columns))
+                {
+                    primaryKeys[objectId] = columns = [];
+                }
+
+                columns.Add(reader.GetString(1));
+            }
+
+            await reader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+            var tables = new List<SqlChangeTrackingTableInfo>();
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                tables.Add(new SqlChangeTrackingTableInfo(
+                    schemaName: reader.GetString(1),
+                    tableName: reader.GetString(2),
+                    primaryKey: primaryKeys.GetValueOrDefault(reader.GetInt32(0)) ?? [],
+                    beginVersion: reader.GetInt64(3),
+                    minValidVersion: reader.GetInt64(4),
+                    trackColumnsUpdated: reader.GetBoolean(5),
+                    currentVersion: currentVersion,
+                    rows: includeSizes ? GetInt64OrZero(reader, 6) : null,
+                    dataSizeMb: includeSizes ? GetDecimalOrZero(reader, 7) : null,
+                    changeTrackingRows: includeSizes ? GetInt64OrZero(reader, 8) : null,
+                    changeTrackingSizeMb: includeSizes ? GetDecimalOrZero(reader, 9) : null));
+            }
+
+            return new SqlChangeTrackingInfo(connection.Database, currentVersion, retention, autoCleanup, snapshotIsolationAllowed, tables);
+        }
+        finally
+        {
+            if (closeConnection)
+            {
+                await connection.CloseAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static long GetInt64OrZero(SqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? 0 : reader.GetInt64(ordinal);
+
+    private static decimal GetDecimalOrZero(SqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? 0 : reader.GetDecimal(ordinal);
+
+    private static string CreateChangeTrackingInfoSql(bool includeSizes)
+    {
+        const string database = """
+            SELECT
+                CHANGE_TRACKING_CURRENT_VERSION(),
+                CTD.retention_period,
+                CTD.retention_period_units_desc,
+                CAST(CTD.is_auto_cleanup_on AS bit),
+                CAST(CASE WHEN D.snapshot_isolation_state = 1 THEN 1 ELSE 0 END AS bit)
+            FROM sys.change_tracking_databases CTD
+            JOIN sys.databases D ON D.database_id = CTD.database_id
+            WHERE CTD.database_id = DB_ID();
+
+            SELECT I.object_id, C.name
+            FROM sys.change_tracking_tables CTT
+            JOIN sys.indexes I ON I.object_id = CTT.object_id AND I.is_primary_key = 1
+            JOIN sys.index_columns IC ON IC.object_id = I.object_id AND IC.index_id = I.index_id
+            JOIN sys.columns C ON C.object_id = IC.object_id AND C.column_id = IC.column_id
+            ORDER BY I.object_id, IC.key_ordinal;
+
+            """;
+
+        // Each size is summed in its own APPLY, joining both before summing would multiply the rows of partitioned tables.
+        // Index 0 is a heap and 1 a clustered index, so other indexes are not counted. A page is 8 KB.
+        var sizes = includeSizes
+            ? """
+                  Data.Rows,
+                  Data.SizeMb,
+                  Side.Rows,
+                  Side.SizeMb
+              FROM sys.change_tracking_tables CTT
+              JOIN sys.tables T ON T.object_id = CTT.object_id
+              JOIN sys.schemas S ON S.schema_id = T.schema_id
+              OUTER APPLY (
+                  SELECT SUM(PS.row_count) AS Rows, CAST(SUM(PS.reserved_page_count) * 8 / 1024.0 AS decimal(19, 2)) AS SizeMb
+                  FROM sys.dm_db_partition_stats PS
+                  WHERE PS.object_id = T.object_id AND PS.index_id IN (0, 1)
+              ) Data
+              OUTER APPLY (
+                  SELECT SUM(PS.row_count) AS Rows, CAST(SUM(PS.reserved_page_count) * 8 / 1024.0 AS decimal(19, 2)) AS SizeMb
+                  FROM sys.internal_tables IT
+                  JOIN sys.dm_db_partition_stats PS ON PS.object_id = IT.object_id AND PS.index_id IN (0, 1)
+                  WHERE IT.parent_object_id = T.object_id AND IT.internal_type = 209 -- Change Tracking
+              ) Side
+              """
+            : """
+                  CAST(NULL AS bigint),
+                  CAST(NULL AS decimal(19, 2)),
+                  CAST(NULL AS bigint),
+                  CAST(NULL AS decimal(19, 2))
+              FROM sys.change_tracking_tables CTT
+              JOIN sys.tables T ON T.object_id = CTT.object_id
+              JOIN sys.schemas S ON S.schema_id = T.schema_id
+              """;
+
+        // CHANGE_TRACKING_MIN_VALID_VERSION, like ReadChangesAsync, so CanReadChangesSince gives the same answer
+        return database + """
+            SELECT
+                T.object_id,
+                S.name,
+                T.name,
+                CTT.begin_version,
+                CHANGE_TRACKING_MIN_VALID_VERSION(T.object_id),
+                CAST(CTT.is_track_columns_updated_on AS bit),
+
+            """ + sizes + """
+
+            ORDER BY S.name, T.name;
+            """;
     }
 
     private sealed record TableInfo(string QuotedName, long MinValidVersion, long CurrentVersion, List<string> PrimaryKey, List<string> Columns);
@@ -286,5 +458,5 @@ public class SqlChangeTrackingHelper
         if (_changeTableColumns.HasFlag(ChangeTableColumns.Context)) yield return ("SYS_CHANGE_CONTEXT", "varbinary(128)");
     }
 
-    private static string Quote(string name) => "[" + name.Replace("]", "]]") + "]";
+    internal static string Quote(string name) => "[" + name.Replace("]", "]]") + "]";
 }

@@ -65,6 +65,29 @@ var helper = new SqlChangeTrackingHelper("dbo.Bookings")
 | `ChangedColumns` | `SYS_CHANGE_COLUMNS` | Which columns were updated, requires `TRACK_COLUMNS_UPDATED = ON` |
 | `Context` | `SYS_CHANGE_CONTEXT` | Set by the writer with `WITH CHANGE_TRACKING_CONTEXT (@context)`, for example to recognize your own changes |
 
+## List the tracked tables
+`GetChangeTrackingInfoAsync` returns the Change Tracking settings of the database and the tables that have Change Tracking enabled.
+```csharp
+var info = await SqlChangeTrackingHelper.GetChangeTrackingInfoAsync(connection, includeSizes: true);
+
+Console.WriteLine($"Version {info.CurrentVersion}, retention {info.Retention}, auto cleanup {info.AutoCleanup}, snapshot isolation {info.SnapshotIsolationAllowed}");
+
+foreach (var table in info.Tables)
+{
+    Console.WriteLine($"{table.QuotedName}: key ({string.Join(", ", table.PrimaryKey)}), min valid version {table.MinValidVersion}, " +
+                      $"{table.Rows} rows ({table.DataSizeMb} MB), {table.ChangeTrackingRows} tracked changes ({table.ChangeTrackingSizeMb} MB)");
+
+    if (!table.CanReadChangesSince(lastVersion)) // Same rule as ReadChangesAsync
+    {
+        // Needs a full load
+    }
+}
+```
+- **Retention** is how long a sync can be down before it needs a full load.
+- **BeginVersion** is when Change Tracking was enabled for the table. A recent version explains a jump in `MinValidVersion`.
+- **ChangeTrackingRows / ChangeTrackingSizeMb** is the internal table where SQL Server keeps the changes. If it keeps growing although the retention is short, the cleanup doesn't keep up.
+- `includeSizes` reads `sys.dm_db_partition_stats`, which requires `VIEW DATABASE STATE`. Without it only `VIEW CHANGE TRACKING` is needed, like for `ReadChangesAsync`.
+
 ## Requirements
 - `ALTER DATABASE ... SET ALLOW_SNAPSHOT_ISOLATION ON`
 - `ALTER DATABASE ... SET CHANGE_TRACKING = ON` and `ALTER TABLE ... ENABLE CHANGE_TRACKING`
