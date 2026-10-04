@@ -28,6 +28,24 @@ public class ChangeTrackingInfoTests(MsSqlFixture fixture) : IClassFixture<MsSql
         info.CurrentVersion.ShouldBe(await connection.ExecuteScalarAsync<long>("SELECT CHANGE_TRACKING_CURRENT_VERSION();"));
     }
 
+    [Theory]
+    [InlineData("90 MINUTES", 90)]
+    [InlineData("36 HOURS", 36 * 60)]
+    public async Task Retention_InOtherUnits(string retention, int expectedMinutes)
+    {
+        var databaseName = $"Retention_{Guid.NewGuid():N}";
+        await using (var connection = new SqlConnection(_connectionString))
+        {
+            await connection.ExecuteAsync($"CREATE DATABASE {databaseName}; ALTER DATABASE {databaseName} SET CHANGE_TRACKING = ON (CHANGE_RETENTION = {retention});");
+        }
+
+        await using var databaseConnection = new SqlConnection(new SqlConnectionStringBuilder(_connectionString) { InitialCatalog = databaseName }.ConnectionString);
+
+        var info = await SqlChangeTrackingHelper.GetChangeTrackingInfoAsync(databaseConnection, cancellationToken: Token);
+
+        info.Retention.ShouldBe(TimeSpan.FromMinutes(expectedMinutes));
+    }
+
     [Fact]
     public async Task Tables_OnlyTrackedWithPrimaryKeyAndSettings()
     {
@@ -123,6 +141,38 @@ public class ChangeTrackingInfoTests(MsSqlFixture fixture) : IClassFixture<MsSql
 
         await using var changes = await new SqlChangeTrackingHelper(table.QuotedName).ReadChangesAsync(connection, table.MinValidVersion, cancellationToken: Token);
         changes.IsFullLoad.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task WithoutViewAnyDatabase_SeesTheCurrentDatabase()
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(Token);
+        var tableName = NewTableName();
+        var login = $"User_{Guid.NewGuid():N}";
+        const string password = "Test_Passw0rd!";
+
+        // sys.change_tracking_databases has the permissions of sys.databases, where other databases require VIEW ANY DATABASE
+        await connection.ExecuteAsync($"""
+            CREATE TABLE dbo.{tableName} (Id int PRIMARY KEY);
+            ALTER TABLE dbo.{tableName} ENABLE CHANGE_TRACKING;
+            CREATE LOGIN {login} WITH PASSWORD = '{password}';
+            EXEC master.sys.sp_executesql N'DENY VIEW ANY DATABASE TO {login};';
+            CREATE USER {login} FOR LOGIN {login};
+            GRANT VIEW CHANGE TRACKING ON dbo.{tableName} TO {login};
+            """);
+
+        var userConnectionString = new SqlConnectionStringBuilder(_connectionString) { UserID = login, Password = password }.ConnectionString;
+        await using var userConnection = new SqlConnection(userConnectionString);
+
+        // The DENY works, other databases are hidden
+        (await userConnection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM sys.databases WHERE name = 'model';")).ShouldBe(0);
+
+        var info = await SqlChangeTrackingHelper.GetChangeTrackingInfoAsync(userConnection, cancellationToken: Token);
+
+        info.Retention.ShouldBe(TimeSpan.FromDays(2));
+        info.SnapshotIsolationAllowed.ShouldBeTrue();
+        info.Tables.Select(x => x.TableName).ShouldBe([tableName]);
     }
 
     [Fact]

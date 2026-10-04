@@ -88,6 +88,24 @@ foreach (var table in info.Tables)
 - **ChangeTrackingRows / ChangeTrackingSizeMb** is the internal table where SQL Server keeps the changes. If it keeps growing although the retention is short, the cleanup doesn't keep up.
 - `includeSizes` reads `sys.dm_db_partition_stats`, which requires `VIEW DATABASE STATE`. Without it only `VIEW CHANGE TRACKING` is needed, like for `ReadChangesAsync`.
 
+## How long until a sync needs a full load
+`GetVersionStatusAsync` tells how a saved version stands for a table, for example to alert before a sync that hasn't run for a while needs an expensive full load.
+```csharp
+var status = await new SqlChangeTrackingHelper("dbo.Bookings").GetVersionStatusAsync(connection, lastVersion);
+
+if (!status.CanReadChanges)
+{
+    // Too late, the next sync is a full load
+}
+else if (status.ExpiresIn < TimeSpan.FromHours(12))
+{
+    // Warn: the version is status.Age old, and the changes are only kept for status.Retention
+}
+```
+- `CommittedAt` is when the version was committed, in UTC, and `Age` is how long ago, measured by the database clock.
+- `ExpiresIn` is `Retention` minus `Age`. It's an estimate: the cleanup runs in the background and can be behind, so `ExpiresIn` can be negative while `CanReadChanges` is still true. `CanReadChanges` is what decides, with the same rule as `ReadChangesAsync`.
+- The commit time comes from `sys.dm_tran_commit_table`, which requires `VIEW SERVER STATE` on SQL Server, and `VIEW DATABASE STATE` on Azure SQL Database. Without it SQL Server returns no rows instead of an error, so `GetVersionStatusAsync` throws when it can't see the commit table.
+
 ## Requirements
 - `ALTER DATABASE ... SET ALLOW_SNAPSHOT_ISOLATION ON`
 - `ALTER DATABASE ... SET CHANGE_TRACKING = ON` and `ALTER TABLE ... ENABLE CHANGE_TRACKING`

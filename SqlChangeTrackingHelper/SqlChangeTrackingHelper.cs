@@ -135,6 +135,119 @@ public class SqlChangeTrackingHelper
     }
 
     /// <summary>
+    /// Gets how a version stands for the table: if the changes since it can still be read, when it was committed and roughly how long until it's too old.
+    /// Useful for alerting before a sync that hasn't run for a while needs a full load.
+    /// <para>
+    /// The commit time comes from sys.dm_tran_commit_table, which requires VIEW SERVER STATE on SQL Server, and VIEW DATABASE STATE on Azure SQL Database.
+    /// Without it SQL Server returns no rows instead of an error, so this method throws if it can't see the commit table.
+    /// </para>
+    /// </summary>
+    /// <param name="connection">SqlConnection to the database. If it's closed, it's opened and closed again.</param>
+    /// <param name="version">The version from the previous sync</param>
+    /// <param name="timeout">Number of seconds for the command to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
+    /// <param name="cancellationToken">Cancels the operation</param>
+    /// <returns>The status of the version</returns>
+    /// <exception cref="InvalidOperationException">If the table doesn't exist, Change Tracking is not enabled, or the commit table can't be read</exception>
+    public async Task<SqlChangeTrackingVersionStatus> GetVersionStatusAsync(SqlConnection connection, long version, int timeout = 30, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // commit_time is UTC, so the age is calculated by the database with SYSUTCDATETIME, independent of time zones and the client clock.
+        // Without permission sys.dm_tran_commit_table is just empty. If it's empty with permission, there is nothing to see,
+        // so the permission is only checked then. Azure SQL Database (EngineEdition 5) has no server permissions.
+        // The commit is looked up with =, since a version is always a commit_ts. The view is a UNION, so <= with ORDER BY scans the whole commit table.
+        const string sql = """
+            DECLARE @ObjectId int = OBJECT_ID(@TableName);
+
+            SELECT
+                SCHEMA_NAME(T.schema_id),
+                T.name,
+                CHANGE_TRACKING_MIN_VALID_VERSION(@ObjectId),
+                CHANGE_TRACKING_CURRENT_VERSION(),
+                CTD.retention_period,
+                CTD.retention_period_units,
+                V.commit_time,
+                V.AgeMilliseconds,
+                CAST(CASE
+                    WHEN EXISTS (SELECT 1 FROM sys.dm_tran_commit_table) THEN 1
+                    WHEN SERVERPROPERTY('EngineEdition') = 5 THEN ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DATABASE STATE'), 0)
+                    ELSE ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE'), 0)
+                END AS bit)
+            FROM sys.tables T
+            LEFT JOIN sys.change_tracking_databases CTD ON CTD.database_id = DB_ID()
+            OUTER APPLY (
+                SELECT TOP (1) C.commit_time, DATEDIFF_BIG(millisecond, C.commit_time, SYSUTCDATETIME()) AS AgeMilliseconds
+                FROM sys.dm_tran_commit_table C
+                WHERE C.commit_ts = @Version
+            ) V
+            WHERE T.object_id = @ObjectId;
+            """;
+
+        var closeConnection = false;
+        if (connection.State != ConnectionState.Open)
+        {
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            closeConnection = true;
+        }
+
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandTimeout = timeout;
+            command.CommandText = sql;
+            command.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 4000) { Value = _tableName });
+            command.Parameters.Add(new SqlParameter("@Version", SqlDbType.BigInt) { Value = version });
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw new InvalidOperationException($"The table '{_tableName}' was not found in the database '{connection.Database}'.");
+            }
+
+            var quotedName = Quote(reader.GetString(0)) + "." + Quote(reader.GetString(1));
+            if (reader.IsDBNull(2) || reader.IsDBNull(4))
+            {
+                throw new InvalidOperationException($"Change Tracking is not enabled for {quotedName}. Enable it with: ALTER TABLE {quotedName} ENABLE CHANGE_TRACKING;");
+            }
+
+            if (!reader.GetBoolean(8))
+            {
+                throw new InvalidOperationException(
+                    "Can't read sys.dm_tran_commit_table, which is needed to know when a version was committed. " +
+                    "It requires VIEW SERVER STATE on SQL Server, and VIEW DATABASE STATE on Azure SQL Database.");
+            }
+
+            DateTime? committedAt = reader.IsDBNull(6) ? null : DateTime.SpecifyKind(reader.GetDateTime(6), DateTimeKind.Utc);
+            TimeSpan? age = reader.IsDBNull(7) ? null : TimeSpan.FromMilliseconds(reader.GetInt64(7));
+
+            return new SqlChangeTrackingVersionStatus(
+                version,
+                minValidVersion: reader.GetInt64(2),
+                currentVersion: reader.GetInt64(3),
+                retention: ToRetention(reader.GetInt32(4), reader.GetByte(5)),
+                committedAt,
+                age);
+        }
+        finally
+        {
+            if (closeConnection)
+            {
+                await connection.CloseAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    // retention_period_units: 1 = minutes, 2 = hours, 3 = days
+    private static TimeSpan ToRetention(int period, byte units) => units switch
+    {
+        1 => TimeSpan.FromMinutes(period),
+        2 => TimeSpan.FromHours(period),
+        _ => TimeSpan.FromDays(period)
+    };
+
+    /// <summary>
     /// Changes can only be read since a version from CHANGE_TRACKING_MIN_VALID_VERSION up to the current version.
     /// A newer version than the current one, for example after a database restore, can't be trusted either.
     /// </summary>
@@ -179,12 +292,7 @@ public class SqlChangeTrackingHelper
             }
 
             var currentVersion = reader.GetInt64(0);
-            var retention = reader.GetString(2) switch
-            {
-                "MINUTES" => TimeSpan.FromMinutes(reader.GetInt32(1)),
-                "HOURS" => TimeSpan.FromHours(reader.GetInt32(1)),
-                _ => TimeSpan.FromDays(reader.GetInt32(1))
-            };
+            var retention = ToRetention(reader.GetInt32(1), reader.GetByte(2));
             var autoCleanup = reader.GetBoolean(3);
             var snapshotIsolationAllowed = reader.GetBoolean(4);
 
@@ -241,7 +349,7 @@ public class SqlChangeTrackingHelper
             SELECT
                 CHANGE_TRACKING_CURRENT_VERSION(),
                 CTD.retention_period,
-                CTD.retention_period_units_desc,
+                CTD.retention_period_units,
                 CAST(CTD.is_auto_cleanup_on AS bit),
                 CAST(CASE WHEN D.snapshot_isolation_state = 1 THEN 1 ELSE 0 END AS bit)
             FROM sys.change_tracking_databases CTD
